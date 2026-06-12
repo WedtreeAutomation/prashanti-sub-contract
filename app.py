@@ -583,7 +583,7 @@ def main():
     st.markdown("""
 <div class="footer">
 <p>© 2024 Odoo Automation Portal | Powered by Streamlit</p>
-<p style="margin-top: 0.5rem;">Version 2.0 | Enterprise Automation Solution</p>
+<p style="margin-top: 0.5rem;">Enterprise Automation Solution</p>
 </div>
     """, unsafe_allow_html=True)
  
