@@ -6,10 +6,11 @@ import io
 import os
 from dotenv import load_dotenv
 from datetime import datetime
- 
+from collections import defaultdict
+
 # Load environment variables
 load_dotenv()
- 
+
 # ==========================================
 # PAGE CONFIG & STYLING
 # ==========================================
@@ -19,7 +20,7 @@ st.set_page_config(
     page_icon="⚙️",
     initial_sidebar_state="expanded"
 )
- 
+
 # Professional Light Theme CSS
 st.markdown("""
 <style>
@@ -153,7 +154,7 @@ st.markdown("""
         }
 </style>
 """, unsafe_allow_html=True)
- 
+
 # ==========================================
 # SESSION STATE INITIALIZATION
 # ==========================================
@@ -161,7 +162,7 @@ if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
 if 'username' not in st.session_state:
     st.session_state.username = None
- 
+
 # ==========================================
 # AUTHENTICATION FUNCTION
 # ==========================================
@@ -169,7 +170,7 @@ def authenticate_user(username, password):
     admin_user = os.getenv('ADMIN_USER')
     admin_password = os.getenv('ADMIN_PASSWORD')
     return username == admin_user and password == admin_password
- 
+
 # ==========================================
 # LOGIN CONTAINER
 # ==========================================
@@ -195,7 +196,7 @@ def login_sidebar():
                 st.session_state.logged_in = False
                 st.session_state.username = None
                 st.rerun()
- 
+
 # ==========================================
 # ODOO CONNECTION HELPER
 # ==========================================
@@ -214,19 +215,27 @@ def connect_to_odoo():
         return uid, models, "Success"
     except Exception as e:
         return None, None, str(e)
- 
+
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
+def normalize_product_name(name):
+    return str(name).upper().replace("-", "").replace(" ", "").strip()
+
 # ==========================================
 # PROCESS LOGIC FUNCTIONS
 # ==========================================
 def process_product_creation(df, models, db, uid, password, log_container):
     RESUPPLY_ROUTE_ID = 12
     results = []
+    
     def execute_button(product_id, method_name):
         try:
             models.execute_kw(db, uid, password, "product.template", method_name, [[product_id]])
         except Fault as e:
             if "allow_none" not in str(e):
                 raise Exception(f"{method_name} failed: {e}")
+    
     for index, row in df.iterrows():
         sku, product_name = "Unknown", "Unknown"
         try:
@@ -235,14 +244,18 @@ def process_product_creation(df, models, db, uid, password, log_container):
             category_name = str(row.get("Category", "")).strip()
             sales_price = float(row.get("Sales Price", 0.0))
             cost_price = float(row.get("Cost Price", 0.0))
+            
             log_container.write(f"**Processing SKU:** {sku} | {product_name}")
+            
             category_ids = models.execute_kw(db, uid, password, "product.category", "search", [[("name", "=", category_name)]], {"limit": 1})
             if not category_ids:
                 raise Exception(f"Category Not Found: {category_name}")
             category_id = category_ids[0]
+            
             product_ids = models.execute_kw(db, uid, password, "product.template", "search", [[("sku", "=", sku)]])
             if not product_ids:
                 product_ids = models.execute_kw(db, uid, password, "product.template", "search", [[("default_code", "=", sku)]])
+            
             if product_ids:
                 product_id = product_ids[0]
                 execute_button(product_id, "reset_to_draft")
@@ -267,8 +280,9 @@ def process_product_creation(df, models, db, uid, password, log_container):
         except Exception as e:
             log_container.error(f"Error on row {index + 1}: {str(e)}")
             results.append({"SKU": sku, "Product Name": product_name, "Status": "Error", "Action": "Failed", "Message": str(e)})
+    
     return results
- 
+
 def process_manufacturing(df, models, db, uid, password, log_container):
     results = []
     for index, row in df.iterrows():
@@ -278,133 +292,562 @@ def process_manufacturing(df, models, db, uid, password, log_container):
             component_sku = str(row.get("Component_SKU", "")).strip()
             component_qty = float(row.get("Component_Qty", 0.0))
             subcontractor_name = str(row.get("Subcontractor", "")).strip()
+            
             log_container.write(f"**Processing BOM:** {finished_sku} (Component: {component_sku})")
+            
             finished_product = models.execute_kw(db, uid, password, 'product.template', 'search_read', [[('sku', '=', finished_sku)]], {'fields': ['id'], 'limit': 1})
             if not finished_product:
                 raise Exception(f"Finished Product not found: {finished_sku}")
             finished_product_tmpl_id = finished_product[0]['id']
+            
             component_template = models.execute_kw(db, uid, password, 'product.template', 'search_read', [[('sku', '=', component_sku)]], {'fields': ['id'], 'limit': 1})
             if not component_template:
                 raise Exception(f"Component Product not found: {component_sku}")
+            
             component_variant = models.execute_kw(db, uid, password, 'product.product', 'search_read', [[('product_tmpl_id', '=', component_template[0]['id'])]], {'fields': ['id'], 'limit': 1})
             if not component_variant:
                 raise Exception(f"No variant found for {component_sku}")
             component_product_id = component_variant[0]['id']
+            
             subcontractor = models.execute_kw(db, uid, password, 'res.partner', 'search_read', [[('name', '=', subcontractor_name)]], {'fields': ['id'], 'limit': 1})
             if not subcontractor:
                 raise Exception(f"Subcontractor not found: {subcontractor_name}")
             subcontractor_id = subcontractor[0]['id']
+            
             existing_bom = models.execute_kw(db, uid, password, 'mrp.bom', 'search', [[('product_tmpl_id', '=', finished_product_tmpl_id)]], {'limit': 1})
             if existing_bom:
                 log_container.info(f"⚠️ BOM already exists for {finished_sku}. ID: {existing_bom[0]}")
                 results.append({"Finished SKU": finished_sku, "Component SKU": component_sku, "Status": "Skipped", "Message": f"BOM already exists (ID: {existing_bom[0]})"})
                 continue
+            
             bom_vals = {
-                'product_tmpl_id': finished_product_tmpl_id, 'product_qty': 1, 'type': 'subcontract',
+                'product_tmpl_id': finished_product_tmpl_id, 
+                'product_qty': 1, 
+                'type': 'subcontract',
                 'subcontractor_ids': [(6, 0, [subcontractor_id])],
                 'bom_line_ids': [(0, 0, {'product_id': component_product_id, 'product_qty': component_qty})]
             }
+            
             bom_id = models.execute_kw(db, uid, password, 'mrp.bom', 'create', [bom_vals])
             log_container.success(f"✅ BOM Created Successfully for {finished_sku}. BOM ID: {bom_id}")
             results.append({"Finished SKU": finished_sku, "Component SKU": component_sku, "Status": "Success", "Message": f"Created BOM ID {bom_id}"})
         except Exception as e:
             log_container.error(f"Error on row {index + 1}: {str(e)}")
             results.append({"Finished SKU": finished_sku, "Component SKU": component_sku, "Status": "Error", "Message": str(e)})
+    
     return results
- 
+
 def process_purchase_order(df, models, db, uid, password, log_container):
+    """
+    Create a single Purchase Order with all rows from the Excel file
+    """
     results = []
-    for index, row in df.iterrows():
-        vendor_name, product_name = "Unknown", "Unknown"
-        try:
-            vendor_name = str(row.get("Vendor_Name", "")).strip()
-            purchase_team_name = str(row.get("Purchase_Team", "")).strip()
-            product_name = str(row.get("Product_Name", "")).strip()
-            qty = float(row.get("Qty", 0.0))
-            price_unit = float(row.get("Price_Unit", 0.0))
-            discount = float(row.get("Discount", 0.0))
-            partner_ref = str(row.get("Partner_Ref", "")).strip()
-            log_container.write(f"**Processing PO:** {vendor_name} | {product_name}")
-            partner = models.execute_kw(db, uid, password, 'res.partner', 'search_read', [[('name', '=', vendor_name)]], {'fields': ['id'], 'limit': 1})
-            if not partner:
-                raise Exception(f"Vendor not found: {vendor_name}")
-            team = models.execute_kw(db, uid, password, 'purchase.team', 'search_read', [[('name', '=', purchase_team_name)]], {'fields': ['id'], 'limit': 1})
-            if not team:
-                raise Exception(f"Purchase Team not found: {purchase_team_name}")
-            product_template = models.execute_kw(db, uid, password, 'product.template', 'search_read', [[('name', '=', product_name)]], {'fields': ['id', 'name'], 'limit': 1})
-            if not product_template:
-                raise Exception(f"Product not found: {product_name}")
-            product_variant = models.execute_kw(db, uid, password, 'product.product', 'search_read', [[('product_tmpl_id', '=', product_template[0]['id'])]], {'fields': ['id'], 'limit': 1})
-            if not product_variant:
-                raise Exception(f"Product Variant not found: {product_name}")
-            po_vals = {
-                'partner_id': partner[0]['id'], 'team_id': team[0]['id'], 'partner_ref': partner_ref,
-                'order_line': [(0, 0, {
-                    'name': product_template[0]['name'], 'product_id': product_variant[0]['id'],
-                    'product_template_id': product_template[0]['id'], 'product_qty': qty,
-                    'price_unit': price_unit, 'discount': discount
-                })]
-            }
-            po_id = models.execute_kw(db, uid, password, 'purchase.order', 'create', [po_vals])
-            models.execute_kw(db, uid, password, 'purchase.order', 'button_confirm', [[po_id]])
-            models.execute_kw(db, uid, password, 'purchase.order', 'button_approve', [[po_id]])
-            po = models.execute_kw(db, uid, password, 'purchase.order', 'read', [[po_id]], {'fields': ['name']})
-            log_container.success(f"✅ PO Approved: {po[0]['name']}")
-            results.append({"Vendor": vendor_name, "Product": product_name, "Status": "Success", "Message": f"PO Approved: {po[0]['name']}"})
-        except Exception as e:
-            log_container.error(f"Error on row {index + 1}: {str(e)}")
-            results.append({"Vendor": vendor_name, "Product": product_name, "Status": "Error", "Message": str(e)})
+    
+    try:
+        # Validate required columns
+        required_cols = ["Vendor_Name", "Purchase_Team", "Product_Name", "Qty", "Price_Unit", "Discount", "Partner_Ref"]
+        for col in required_cols:
+            if col not in df.columns:
+                raise Exception(f"Missing column: {col}")
+        
+        # Get PO header details from first row
+        vendor_name = str(df.iloc[0]["Vendor_Name"]).strip()
+        purchase_team_name = str(df.iloc[0]["Purchase_Team"]).strip()
+        partner_ref = str(df.iloc[0]["Partner_Ref"]).strip()
+        
+        log_container.write("=" * 80)
+        log_container.write("CREATING SINGLE PURCHASE ORDER")
+        log_container.write("=" * 80)
+        log_container.write(f"Vendor       : {vendor_name}")
+        log_container.write(f"Purchase Team: {purchase_team_name}")
+        log_container.write(f"Partner Ref  : {partner_ref}")
+        log_container.write("=" * 80)
+        
+        # ==========================================
+        # Get Vendor
+        # ==========================================
+        partner = models.execute_kw(
+            db, uid, password,
+            'res.partner',
+            'search_read',
+            [[('name', '=', vendor_name)]],
+            {'fields': ['id', 'name'], 'limit': 1}
+        )
+        
+        if not partner:
+            raise Exception(f"Vendor not found: {vendor_name}")
+        partner_id = partner[0]['id']
+        
+        # ==========================================
+        # Get Purchase Team
+        # ==========================================
+        team = models.execute_kw(
+            db, uid, password,
+            'purchase.team',
+            'search_read',
+            [[('name', '=', purchase_team_name)]],
+            {'fields': ['id', 'name'], 'limit': 1}
+        )
+        
+        if not team:
+            raise Exception(f"Purchase Team not found: {purchase_team_name}")
+        team_id = team[0]['id']
+        
+        # ==========================================
+        # Build PO Lines
+        # ==========================================
+        order_lines = []
+        skipped_products = []
+        
+        for index, row in df.iterrows():
+            try:
+                product_name = str(row["Product_Name"]).strip()
+                qty = float(row["Qty"])
+                price_unit = float(row["Price_Unit"])
+                discount = float(row["Discount"])
+                
+                log_container.write(f"Processing Product {index + 1} -> {product_name}")
+                
+                # Get Product Template
+                product_template = models.execute_kw(
+                    db, uid, password,
+                    'product.template',
+                    'search_read',
+                    [[('name', '=', product_name)]],
+                    {'fields': ['id', 'name'], 'limit': 1}
+                )
+                
+                if not product_template:
+                    skipped_products.append(product_name)
+                    log_container.warning(f"Product not found: {product_name}")
+                    continue
+                
+                product_template_id = product_template[0]['id']
+                product_description = product_template[0]['name']
+                
+                # Get Product Variant
+                product_variant = models.execute_kw(
+                    db, uid, password,
+                    'product.product',
+                    'search_read',
+                    [[('product_tmpl_id', '=', product_template_id)]],
+                    {'fields': ['id', 'display_name'], 'limit': 1}
+                )
+                
+                if not product_variant:
+                    skipped_products.append(product_name)
+                    log_container.warning(f"Product Variant not found: {product_name}")
+                    continue
+                
+                product_id = product_variant[0]['id']
+                
+                # Add Order Line
+                order_lines.append(
+                    (0, 0, {
+                        'name': product_description,
+                        'product_id': product_id,
+                        'product_template_id': product_template_id,
+                        'product_qty': qty,
+                        'price_unit': price_unit,
+                        'discount': discount
+                    })
+                )
+                
+                log_container.write(f"Added -> {product_name} | Qty={qty}")
+                
+            except Exception as e:
+                log_container.error(f"Error in row {index + 1}: {str(e)}")
+                results.append({
+                    "Vendor": vendor_name, 
+                    "Product": row.get("Product_Name", "Unknown"), 
+                    "Status": "Error", 
+                    "Message": str(e)
+                })
+        
+        # ==========================================
+        # Validation
+        # ==========================================
+        if not order_lines:
+            raise Exception("No valid products found in Excel")
+        
+        if skipped_products:
+            log_container.warning(f"Skipped {len(skipped_products)} products: {', '.join(skipped_products)}")
+        
+        # ==========================================
+        # Create Purchase Order
+        # ==========================================
+        po_vals = {
+            'partner_id': partner_id,
+            'team_id': team_id,
+            'partner_ref': partner_ref,
+            'order_line': order_lines
+        }
+        
+        po_id = models.execute_kw(
+            db, uid, password,
+            'purchase.order',
+            'create',
+            [po_vals]
+        )
+        
+        log_container.write(f"\nPurchase Order Created. PO ID: {po_id}")
+        
+        # ==========================================
+        # Confirm PO
+        # ==========================================
+        models.execute_kw(
+            db, uid, password,
+            'purchase.order',
+            'button_confirm',
+            [[po_id]]
+        )
+        log_container.write("Purchase Order Confirmed")
+        
+        # ==========================================
+        # Approve PO
+        # ==========================================
+        models.execute_kw(
+            db, uid, password,
+            'purchase.order',
+            'button_approve',
+            [[po_id]]
+        )
+        log_container.write("Purchase Order Approved")
+        
+        # ==========================================
+        # Get PO Number
+        # ==========================================
+        po = models.execute_kw(
+            db, uid, password,
+            'purchase.order',
+            'read',
+            [[po_id]],
+            {'fields': ['name']}
+        )
+        po_number = po[0]['name']
+        
+        log_container.success(f"\n✅ PO Number: {po_number}")
+        
+        # Add success result for each row
+        for index, row in df.iterrows():
+            results.append({
+                "Vendor": vendor_name, 
+                "Product": row.get("Product_Name", "Unknown"), 
+                "Status": "Success", 
+                "Message": f"PO Created: {po_number}"
+            })
+        
+    except Exception as e:
+        log_container.error(f"Error creating Purchase Order: {str(e)}")
+        # Add error for each row
+        for index, row in df.iterrows():
+            results.append({
+                "Vendor": row.get("Vendor_Name", "Unknown"), 
+                "Product": row.get("Product_Name", "Unknown"), 
+                "Status": "Error", 
+                "Message": str(e)
+            })
+    
     return results
- 
+
 def process_resupply(df, models, db, uid, password, log_container):
+    """
+    Process Resupply based on the new logic
+    """
     results = []
-    for index, row in df.iterrows():
-        po_number, lot_number = "Unknown", "Unknown"
-        try:
-            po_number = str(row.get("PO_NUMBER", "")).strip()
-            lot_number = str(row.get("LOT_NUMBER", "")).strip()
-            demand_qty = float(row.get("DEMAND_QTY", 0.0))
-            source_location_name = str(row.get("SOURCE_LOCATION_NAME", "")).strip()
-            log_container.write(f"**Processing Resupply:** PO {po_number} | Lot {lot_number}")
-            location = models.execute_kw(db, uid, password, 'stock.location', 'search_read', [[('complete_name', '=', source_location_name)]], {'fields': ['id'], 'limit': 1})
-            if not location:
-                raise Exception(f"Location Not Found: {source_location_name}")
-            new_source_location_id = location[0]['id']
-            po = models.execute_kw(db, uid, password, 'purchase.order', 'search_read', [[('name', '=', po_number)]], {'fields': ['picking_ids'], 'limit': 1})
-            if not po or not po[0]['picking_ids']:
-                raise Exception(f"PO/Receipt Not Found: {po_number}")
-            receipt_picking_id = po[0]['picking_ids'][0]
-            receipt = models.execute_kw(db, uid, password, 'stock.picking', 'read', [[receipt_picking_id]], {'fields': ['name']})
-            resupply = models.execute_kw(db, uid, password, 'stock.picking', 'search_read', [[('origin', '=', receipt[0]['name'])]], {'fields': ['id', 'name'], 'limit': 1})
-            if not resupply:
-                raise Exception("Resupply Picking Not Found")
-            picking_id = resupply[0]['id']
-            models.execute_kw(db, uid, password, 'stock.picking', 'write', [[picking_id], {'location_id': new_source_location_id}])
-            moves = models.execute_kw(db, uid, password, 'stock.move', 'search_read', [[('picking_id', '=', picking_id)]], {'fields': ['id', 'product_id', 'location_dest_id']})
-            if not moves:
-                raise Exception("No Move Found")
-            move = moves[0]
-            models.execute_kw(db, uid, password, 'stock.move', 'write', [[move['id']], {'location_id': new_source_location_id}])
-            lot = models.execute_kw(db, uid, password, 'stock.lot', 'search_read', [[('name', '=', lot_number)]], {'fields': ['id'], 'limit': 1})
-            if not lot:
-                raise Exception(f"Lot Not Found: {lot_number}")
-            existing_lines = models.execute_kw(db, uid, password, 'stock.move.line', 'search_read', [[('move_id', '=', move['id'])]], {'fields': ['id']})
-            for line in existing_lines:
-                models.execute_kw(db, uid, password, 'stock.move.line', 'unlink', [[line['id']]])
-            models.execute_kw(db, uid, password, 'stock.move.line', 'create', [{
-                'move_id': move['id'], 'product_id': move['product_id'][0], 'lot_id': lot[0]['id'],
-                'lot_name': lot_number, 'quantity': demand_qty, 'manual_qty_done': demand_qty,
-                'picked': True, 'location_id': new_source_location_id, 'location_dest_id': move['location_dest_id'][0]
-            }])
-            models.execute_kw(db, uid, password, 'stock.picking', 'button_validate', [[picking_id]])
-            models.execute_kw(db, uid, password, 'stock.picking', 'button_validate', [[receipt_picking_id]])
-            log_container.success(f"✅ Resupply Validated Successfully for PO {po_number}")
-            results.append({"PO Number": po_number, "Lot Number": lot_number, "Status": "Success", "Message": "Resupply validated"})
-        except Exception as e:
-            log_container.error(f"Error on row {index + 1}: {str(e)}")
-            results.append({"PO Number": po_number, "Lot Number": lot_number, "Status": "Error", "Message": str(e)})
+    
+    try:
+        # Validate required columns
+        required_cols = ["Purchase_order", "Product_Name", "Lot_Number", "Source_Location"]
+        for col in required_cols:
+            if col not in df.columns:
+                raise Exception(f"Missing column: {col}")
+        
+        # ==========================================
+        # Build Mapping: (PO, Product) -> Lots + Source Location
+        # ==========================================
+        mapping = {}
+        
+        for _, row in df.iterrows():
+            po = str(row["Purchase_order"]).strip()
+            product = str(row["Product_Name"]).strip()
+            lot = str(row["Lot_Number"]).strip()
+            source_location = str(row["Source_Location"]).strip()
+            
+            key = (po, normalize_product_name(product))
+            
+            if key not in mapping:
+                mapping[key] = {
+                    "lots": [],
+                    "source_location": source_location
+                }
+            
+            mapping[key]["lots"].append(lot)
+        
+        log_container.write(f"Built mapping with {len(mapping)} unique (PO, Product) combinations")
+        
+        # ==========================================
+        # Process each PO
+        # ==========================================
+        for po_number in df["Purchase_order"].dropna().unique():
+            po_number = str(po_number).strip()
+            
+            log_container.write("=" * 80)
+            log_container.write(f"PO : {po_number}")
+            log_container.write("=" * 80)
+            
+            # Get PO
+            po = models.execute_kw(
+                db, uid, password,
+                'purchase.order',
+                'search_read',
+                [[('name', '=', po_number)]],
+                {'fields': ['id', 'picking_ids'], 'limit': 1}
+            )
+            
+            if not po:
+                log_container.warning(f"PO Not Found: {po_number}")
+                results.append({"PO Number": po_number, "Status": "Error", "Message": "PO Not Found"})
+                continue
+            
+            if not po[0]["picking_ids"]:
+                log_container.warning(f"No Receipt Picking Found for PO: {po_number}")
+                results.append({"PO Number": po_number, "Status": "Error", "Message": "No Receipt Picking Found"})
+                continue
+            
+            receipt_picking_id = po[0]["picking_ids"][0]
+            
+            # Get Receipt
+            receipt = models.execute_kw(
+                db, uid, password,
+                'stock.picking',
+                'read',
+                [[receipt_picking_id]],
+                {'fields': ['name']}
+            )
+            
+            receipt_name = receipt[0]["name"]
+            log_container.write(f"Receipt: {receipt_name}")
+            
+            # Get Resupply Pickings
+            resupplies = models.execute_kw(
+                db, uid, password,
+                'stock.picking',
+                'search_read',
+                [[('origin', '=', receipt_name)]],
+                {'fields': ['id', 'name', 'location_id', 'state']}
+            )
+            
+            if not resupplies:
+                log_container.warning(f"No Resupply Pickings found for Receipt: {receipt_name}")
+                results.append({"PO Number": po_number, "Status": "Error", "Message": "No Resupply Pickings Found"})
+                continue
+            
+            for resupply in resupplies:
+                picking_id = resupply["id"]
+                resupply_name = resupply["name"]
+                
+                log_container.write(f"\nResupply: {resupply_name} (State: {resupply['state']})")
+                
+                # Skip if already done
+                if resupply["state"] == "done":
+                    log_container.info(f"Skipping {resupply_name} because it is already validated.")
+                    results.append({"PO Number": po_number, "Resupply": resupply_name, "Status": "Skipped", "Message": "Already validated"})
+                    continue
+                
+                processed_move_found = False
+                
+                # Get Moves
+                moves = models.execute_kw(
+                    db, uid, password,
+                    'stock.move',
+                    'search_read',
+                    [[('picking_id', '=', picking_id)]],
+                    {'fields': ['id', 'product_id', 'product_uom_qty', 'location_id', 'location_dest_id']}
+                )
+                
+                for move in moves:
+                    move_id = move["id"]
+                    product_id = move["product_id"][0]
+                    product_name = move["product_id"][1]
+                    
+                    normalized_product_name = normalize_product_name(product_name)
+                    key = (po_number, normalized_product_name)
+                    
+                    if key not in mapping:
+                        log_container.warning(f"No mapping found for {product_name} (Normalized: {normalized_product_name})")
+                        continue
+                    
+                    processed_move_found = True
+                    
+                    lots = mapping[key]["lots"]
+                    source_location_name = mapping[key]["source_location"]
+                    
+                    log_container.write(f"\n✅ MATCH FOUND")
+                    log_container.write(f"Product : {product_name}")
+                    log_container.write(f"Lots : {lots}")
+                    log_container.write(f"Move ID : {move_id}")
+                    
+                    demand_qty = int(move["product_uom_qty"])
+                    
+                    if len(lots) != demand_qty:
+                        raise Exception(
+                            f"Lot Count Mismatch for {product_name}. "
+                            f"Demand={demand_qty}, Lots={len(lots)}"
+                        )
+                    
+                    # Get Source Location
+                    location = models.execute_kw(
+                        db, uid, password,
+                        'stock.location',
+                        'search_read',
+                        [[('complete_name', '=', source_location_name)]],
+                        {'fields': ['id'], 'limit': 1}
+                    )
+                    
+                    if not location:
+                        raise Exception(f"Location Not Found: {source_location_name}")
+                    
+                    source_location_id = location[0]["id"]
+                    destination_location_id = move["location_dest_id"][0]
+                    
+                    # Update Picking Location
+                    models.execute_kw(
+                        db, uid, password,
+                        'stock.picking',
+                        'write',
+                        [[picking_id], {'location_id': source_location_id}]
+                    )
+                    
+                    # Update Move Location
+                    models.execute_kw(
+                        db, uid, password,
+                        'stock.move',
+                        'write',
+                        [[move_id], {'location_id': source_location_id}]
+                    )
+                    
+                    # Delete existing move lines
+                    existing_lines = models.execute_kw(
+                        db, uid, password,
+                        'stock.move.line',
+                        'search_read',
+                        [[('move_id', '=', move_id)]],
+                        {'fields': ['id']}
+                    )
+                    
+                    for line in existing_lines:
+                        models.execute_kw(
+                            db, uid, password,
+                            'stock.move.line',
+                            'unlink',
+                            [[line["id"]]]
+                        )
+                    
+                    log_container.write(f"Deleted {len(existing_lines)} existing move lines")
+                    
+                    # Create new move lines for each lot
+                    for lot_number in lots:
+                        lot = models.execute_kw(
+                            db, uid, password,
+                            'stock.lot',
+                            'search_read',
+                            [[('name', '=', lot_number)]],
+                            {'fields': ['id'], 'limit': 1}
+                        )
+                        
+                        if not lot:
+                            raise Exception(f"Lot Not Found: {lot_number}")
+                        
+                        lot_id = lot[0]["id"]
+                        
+                        move_line_id = models.execute_kw(
+                            db, uid, password,
+                            'stock.move.line',
+                            'create',
+                            [{
+                                'move_id': move_id,
+                                'product_id': product_id,
+                                'lot_id': lot_id,
+                                'lot_name': lot_number,
+                                'quantity': 1,
+                                'manual_qty_done': 1,
+                                'picked': True,
+                                'location_id': source_location_id,
+                                'location_dest_id': destination_location_id
+                            }]
+                        )
+                        
+                        log_container.write(f"Created Move Line -> {lot_number} ({move_line_id})")
+                
+                # Validate Resupply if any move was processed
+                if processed_move_found:
+                    log_container.write("\n" + "=" * 80)
+                    log_container.write(f"VALIDATING : {resupply_name}")
+                    log_container.write("=" * 80)
+                    
+                    # Validate the picking
+                    models.execute_kw(
+                        db, uid, password,
+                        'stock.picking',
+                        'button_validate',
+                        [[picking_id]]
+                    )
+                    
+                    log_container.success(f"✅ Resupply Validated: {resupply_name}")
+                    
+                    results.append({
+                        "PO Number": po_number, 
+                        "Resupply": resupply_name, 
+                        "Status": "Success", 
+                        "Message": "Resupply validated"
+                    })
+                else:
+                    log_container.warning(
+                        f"Skipping validation for {resupply_name} "
+                        f"because no matching product was found in Excel."
+                    )
+                    results.append({
+                        "PO Number": po_number, 
+                        "Resupply": resupply_name, 
+                        "Status": "Skipped", 
+                        "Message": "No matching product found"
+                    })
+            
+            # Validate Receipt if not already done
+            receipt_state = models.execute_kw(
+                db, uid, password,
+                'stock.picking',
+                'read',
+                [[receipt_picking_id]],
+                {'fields': ['state']}
+            )[0]['state']
+            
+            if receipt_state != 'done':
+                models.execute_kw(
+                    db, uid, password,
+                    'stock.picking',
+                    'button_validate',
+                    [[receipt_picking_id]]
+                )
+                log_container.success(f"✅ Receipt Validated: {receipt_name}")
+            else:
+                log_container.info(f"Receipt already validated: {receipt_name}")
+        
+        log_container.write("\nCompleted Successfully")
+        
+    except Exception as e:
+        log_container.error(f"Error processing Resupply: {str(e)}")
+        # Add error for each row
+        for index, row in df.iterrows():
+            results.append({
+                "PO Number": row.get("Purchase_order", "Unknown"), 
+                "Status": "Error", 
+                "Message": str(e)
+            })
+    
     return results
- 
+
 # ==========================================
 # EXCEL GENERATOR HELPER
 # ==========================================
@@ -414,7 +857,7 @@ def generate_excel_download(results_df):
         results_df.to_excel(writer, index=False, sheet_name='Execution Results')
     processed_data = output.getvalue()
     return processed_data
- 
+
 # ==========================================
 # DASHBOARD METRICS
 # ==========================================
@@ -423,6 +866,8 @@ def display_metrics(results):
         total = len(results)
         success = sum(1 for r in results if r.get('Status') == 'Success')
         errors = sum(1 for r in results if r.get('Status') == 'Error')
+        skipped = sum(1 for r in results if r.get('Status') == 'Skipped')
+        
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.markdown(f"""
@@ -446,20 +891,20 @@ def display_metrics(results):
 </div>
             """, unsafe_allow_html=True)
         with col4:
-            success_rate = (success / total * 100) if total > 0 else 0
             st.markdown(f"""
 <div class="metric-card">
-<div class="metric-value">{success_rate:.1f}%</div>
-<div class="metric-label">Success Rate</div>
+<div class="metric-value" style="color: #ffc107;">{skipped}</div>
+<div class="metric-label">Skipped</div>
 </div>
             """, unsafe_allow_html=True)
- 
+
 # ==========================================
 # MAIN UI APPLICATION
 # ==========================================
 def main():
     # Sidebar for Login
     login_sidebar()
+    
     # Main content area
     if not st.session_state.logged_in:
         st.markdown("""
@@ -483,6 +928,7 @@ def main():
 </div>
         """, unsafe_allow_html=True)
         return
+    
     # Display welcome banner
     st.markdown(f"""
 <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
@@ -498,11 +944,14 @@ def main():
 </div>
 </div>
     """, unsafe_allow_html=True)
+    
     # Main title
     st.title("Odoo Automation Portal")
     st.markdown("<p style='text-align: center; color: #6c757d; margin-bottom: 2rem;'>Streamline your operations with intelligent automation</p>", unsafe_allow_html=True)
+    
     # Create tabs for different operations
     tab1, tab2, tab3, tab4 = st.tabs(["📦 Product Creation", "🏭 Manufacturing", "📄 Purchase Orders", "🔄 Resupply"])
+    
     process_configs = {
         tab1: {
             "name": "Product Creation",
@@ -521,26 +970,31 @@ def main():
         },
         tab4: {
             "name": "Resupply",
-            "cols": ["PO_NUMBER", "LOT_NUMBER", "DEMAND_QTY", "SOURCE_LOCATION_NAME"],
-            "msg": "Upload Excel with columns: PO_NUMBER, LOT_NUMBER, DEMAND_QTY, SOURCE_LOCATION_NAME"
+            "cols": ["Purchase_order", "Product_Name", "Lot_Number", "Source_Location"],
+            "msg": "Upload Excel with columns: Purchase_order, Product_Name, Lot_Number, Source_Location"
         }
     }
+    
     for tab, config in process_configs.items():
         with tab:
             st.header(config['name'])
             st.info(config['msg'])
             uploaded_file = st.file_uploader(f"Upload Excel for {config['name']}", type=["xlsx"], key=config['name'])
+            
             if uploaded_file is not None:
                 try:
                     df = pd.read_excel(uploaded_file)
+                    
                     # Column validation
                     missing_cols = [col for col in config['cols'] if col not in df.columns]
                     if missing_cols:
                         st.error(f"❌ Missing columns: {', '.join(missing_cols)}")
                         continue
+                    
                     with st.expander("📊 Preview Uploaded Data", expanded=True):
                         st.dataframe(df.head(10), use_container_width=True)
                         st.caption(f"Total rows: {len(df)}")
+                    
                     col1, col2, col3 = st.columns([1, 2, 1])
                     with col2:
                         if st.button("🚀 Start Processing", key=f"btn_{config['name']}", use_container_width=True):
@@ -548,11 +1002,14 @@ def main():
                             if not uid:
                                 st.error(f"❌ Failed to connect to Odoo: {conn_status}")
                                 return
+                            
                             st.success("✅ Connected to Odoo successfully!")
+                            
                             # Container for live logs
                             st.subheader("📋 Process Logs")
                             log_container = st.container()
                             results = []
+                            
                             with st.spinner("🔄 Processing records..."):
                                 if config['name'] == "Product Creation":
                                     results = process_product_creation(df, models, os.getenv('ODOO_DB'), uid, os.getenv('ODOO_PASSWORD'), log_container)
@@ -562,14 +1019,18 @@ def main():
                                     results = process_purchase_order(df, models, os.getenv('ODOO_DB'), uid, os.getenv('ODOO_PASSWORD'), log_container)
                                 elif config['name'] == "Resupply":
                                     results = process_resupply(df, models, os.getenv('ODOO_DB'), uid, os.getenv('ODOO_PASSWORD'), log_container)
+                            
                             st.success(f"✅ Execution complete! Processed {len(df)} records.")
+                            
                             # Display metrics
                             display_metrics(results)
+                            
                             # Render Results DataFrame and Download Button
                             if results:
                                 st.subheader("📊 Execution Summary")
                                 results_df = pd.DataFrame(results)
                                 st.dataframe(results_df, use_container_width=True)
+                                
                                 excel_data = generate_excel_download(results_df)
                                 st.download_button(
                                     label="📥 Download Results as Excel",
@@ -577,8 +1038,10 @@ def main():
                                     file_name=f"{config['name'].replace(' ', '_')}_Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                                 )
+                
                 except Exception as e:
                     st.error(f"❌ Failed to read the Excel file: {str(e)}")
+    
     # Footer
     st.markdown("""
 <div class="footer">
@@ -586,6 +1049,6 @@ def main():
 <p style="margin-top: 0.5rem;">Enterprise Automation Solution</p>
 </div>
     """, unsafe_allow_html=True)
- 
+
 if __name__ == "__main__":
     main()
