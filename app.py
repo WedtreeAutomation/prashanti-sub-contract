@@ -190,6 +190,12 @@ BRANCH_KEYWORDS = {
 BRANCH_OPTIONS = ["All"] + list(BRANCH_KEYWORDS.keys())
 
 # ==========================================
+# ROUTE CONFIGURATION (Backend Team Modifications)
+# ==========================================
+RESUPPLY_ROUTE_ID = 12  # Resupply route for internal transfers
+BUY_ROUTE_ID = 5        # Buy route for purchase orders (NEW - Added by backend team)
+
+# ==========================================
 # AUTHENTICATION FUNCTION
 # ==========================================
 def authenticate_user(username, password):
@@ -381,6 +387,11 @@ def execute_button(product_id, method_name, models, db, uid, password):
     except Exception as e:
         return False, f"✗ {method_name}: {e}"
 
+def get_routes_list():
+    """Get the list of route IDs for product configuration"""
+    # Backend team added BUY_ROUTE_ID along with RESUPPLY_ROUTE_ID
+    return [RESUPPLY_ROUTE_ID, BUY_ROUTE_ID]
+
 # ==========================================
 # PROCESS LOGIC FUNCTIONS
 # ==========================================
@@ -392,8 +403,8 @@ def process_product_creation(df, models, db, uid, password, log_container, branc
         log_container.warning(f"No products to process for branch: {branch_filter}")
         return []
     
-    RESUPPLY_ROUTE_ID = 12
     results = []
+    route_ids = get_routes_list()  # Get both Resupply and Buy routes
     
     for index, row in df.iterrows():
         sku, product_name = "Unknown", "Unknown"
@@ -426,14 +437,14 @@ def process_product_creation(df, models, db, uid, password, log_container, branc
                 if not success:
                     log_container.warning(msg)
                 
-                # Prepare update values
+                # Prepare update values with BOTH routes
                 update_vals = {
                     "name": product_name, 
                     "list_price": sales_price, 
                     "standard_price": cost_price, 
                     "categ_id": category_id, 
-                    "tracking": "serial", 
-                    "route_ids": [(4, RESUPPLY_ROUTE_ID)]
+                    "tracking": "serial",
+                    "route_ids": [(6, 0, route_ids)]  # Now includes both Resupply and Buy routes
                 }
                 if company_id:
                     update_vals["company_id"] = company_id
@@ -447,7 +458,7 @@ def process_product_creation(df, models, db, uid, password, log_container, branc
                 execute_button(product_id, "action_submit", models, db, uid, password)
                 execute_button(product_id, "action_approve", models, db, uid, password)
                 results.append({"SKU": sku, "Product Name": product_name, "Status": "Success", 
-                               "Action": "Updated", "Message": f"Updated ID {product_id}"})
+                               "Action": "Updated", "Message": f"Updated ID {product_id} with routes: Resupply({RESUPPLY_ROUTE_ID}), Buy({BUY_ROUTE_ID})"})
             else:
                 product_vals = {
                     "name": product_name, 
@@ -455,8 +466,8 @@ def process_product_creation(df, models, db, uid, password, log_container, branc
                     "list_price": sales_price, 
                     "standard_price": cost_price,
                     "categ_id": category_id, 
-                    "tracking": "serial", 
-                    "route_ids": [(4, RESUPPLY_ROUTE_ID)]
+                    "tracking": "serial",
+                    "route_ids": [(6, 0, route_ids)]  # Now includes both Resupply and Buy routes
                 }
                 if company_id:
                     product_vals["company_id"] = company_id
@@ -467,7 +478,7 @@ def process_product_creation(df, models, db, uid, password, log_container, branc
                 execute_button(product_id, "action_submit", models, db, uid, password)
                 execute_button(product_id, "action_approve", models, db, uid, password)
                 results.append({"SKU": sku, "Product Name": product_name, "Status": "Success", 
-                               "Action": "Created", "Message": f"Created ID {product_id}"})
+                               "Action": "Created", "Message": f"Created ID {product_id} with routes: Resupply({RESUPPLY_ROUTE_ID}), Buy({BUY_ROUTE_ID})"})
         except Exception as e:
             log_container.error(f"Error on row {index + 1}: {str(e)}")
             results.append({"SKU": sku, "Product Name": product_name, "Status": "Error", 
