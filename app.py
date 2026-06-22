@@ -243,6 +243,55 @@ def connect_to_odoo():
         return None, None, str(e)
 
 # ==========================================
+# BRANCH FILTERING HELPER
+# ==========================================
+def filter_data_by_branch(df, branch_name, branch_column="Branch"):
+    """
+    Filter DataFrame rows based on branch selection
+    Supports multiple columns that might contain branch information
+    """
+    if branch_name == "All" or not branch_name:
+        return df
+    
+    # Define all possible branch columns
+    possible_columns = [
+        "Branch", "Location", "Store", "Warehouse", 
+        "Branch_Code", "Store_Code", "Location_Code"
+    ]
+    
+    # Find which columns exist in the dataframe
+    existing_columns = [col for col in possible_columns if col in df.columns]
+    
+    if not existing_columns:
+        # If no branch columns found, try to find any column that might contain branch info
+        for col in df.columns:
+            if any(kw.lower() in col.lower() for kw in ["branch", "location", "store", "warehouse"]):
+                existing_columns.append(col)
+                break
+    
+    if not existing_columns:
+        # No branch-related columns found, return original data with warning
+        st.warning(f"No branch-related columns found. Available columns: {', '.join(df.columns)}")
+        return df
+    
+    # Get branch keywords
+    keywords = BRANCH_KEYWORDS.get(branch_name, [branch_name])
+    
+    # Create filter mask
+    mask = pd.Series([False] * len(df))
+    
+    for col in existing_columns:
+        for kw in keywords:
+            mask = mask | df[col].astype(str).str.contains(kw, case=False, na=False)
+    
+    filtered_df = df[mask]
+    
+    if len(filtered_df) == 0:
+        st.warning(f"No records found for branch: {branch_name} in columns: {', '.join(existing_columns)}")
+    
+    return filtered_df
+
+# ==========================================
 # HELPER FUNCTIONS
 # ==========================================
 def normalize_product_name(name):
@@ -316,6 +365,13 @@ def execute_button(product_id, method_name, models, db, uid, password):
 # PROCESS LOGIC FUNCTIONS
 # ==========================================
 def process_product_creation(df, models, db, uid, password, log_container, branch_filter=None):
+    # Apply branch filter
+    df = filter_data_by_branch(df, branch_filter)
+    
+    if df.empty:
+        log_container.warning(f"No products to process for branch: {branch_filter}")
+        return []
+    
     RESUPPLY_ROUTE_ID = 12
     results = []
     
@@ -373,7 +429,13 @@ def process_product_creation(df, models, db, uid, password, log_container, branc
     return results
 
 def process_bom(df, models, db, uid, password, log_container, branch_filter=None):
-    """Process Bill of Materials (BOM) creation"""
+    # Apply branch filter
+    df = filter_data_by_branch(df, branch_filter)
+    
+    if df.empty:
+        log_container.warning(f"No BOMs to process for branch: {branch_filter}")
+        return []
+    
     results = []
     
     for index, row in df.iterrows():
@@ -472,7 +534,13 @@ def process_bom(df, models, db, uid, password, log_container, branch_filter=None
     return results
 
 def process_purchase_order(df, models, db, uid, password, log_container, branch_filter=None):
-    """Create a single Purchase Order with all rows from the Excel file"""
+    # Apply branch filter
+    df = filter_data_by_branch(df, branch_filter)
+    
+    if df.empty:
+        log_container.warning(f"No purchase orders to process for branch: {branch_filter}")
+        return []
+    
     results = []
     
     try:
@@ -638,7 +706,13 @@ def process_purchase_order(df, models, db, uid, password, log_container, branch_
     return results
 
 def process_resupply(df, models, db, uid, password, log_container, branch_filter=None):
-    """Process Resupply based on the logic"""
+    # Apply branch filter
+    df = filter_data_by_branch(df, branch_filter)
+    
+    if df.empty:
+        log_container.warning(f"No resupplies to process for branch: {branch_filter}")
+        return []
+    
     results = []
     
     try:
@@ -1033,7 +1107,7 @@ def main():
     st.markdown("""
     <div class="branch-selector">
         <h3 style="margin-top: 0;">🏢 Branch Filter</h3>
-        <p style="color: #6c757d; font-size: 0.9rem;">Select a branch to filter operations. This affects product creation and BOM management.</p>
+        <p style="color: #6c757d; font-size: 0.9rem;">Select a branch to filter operations. This affects all automation processes.</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -1052,22 +1126,22 @@ def main():
         tab1: {
             "name": "Product Creation",
             "cols": ["Product Name", "SKU", "Category", "Sales Price", "Cost Price"],
-            "msg": "Upload Excel with columns: Product Name, SKU, Category, Sales Price, Cost Price"
+            "msg": "Upload Excel with columns: Product Name, SKU, Category, Sales Price, Cost Price\nOptional: Branch column for filtering"
         },
         tab2: {
             "name": "Bill Of Materials",
             "cols": ["Finished_SKU", "Component_SKU", "Component_Qty", "Subcontractor"],
-            "msg": "Upload Excel with columns: Finished_SKU, Component_SKU, Component_Qty, Subcontractor"
+            "msg": "Upload Excel with columns: Finished_SKU, Component_SKU, Component_Qty, Subcontractor\nOptional: Branch column for filtering"
         },
         tab3: {
             "name": "Purchaseorder",
             "cols": ["Vendor_Name", "Purchase_Team", "Product_Name", "Qty", "Price_Unit", "Discount", "Partner_Ref"],
-            "msg": "Upload Excel with columns: Vendor_Name, Purchase_Team, Product_Name, Qty, Price_Unit, Discount, Partner_Ref"
+            "msg": "Upload Excel with columns: Vendor_Name, Purchase_Team, Product_Name, Qty, Price_Unit, Discount, Partner_Ref\nOptional: Branch column for filtering"
         },
         tab4: {
             "name": "Resupply",
             "cols": ["Purchase_order", "Product_Name", "Lot_Number", "Source_Location"],
-            "msg": "Upload Excel with columns: Purchase_order, Product_Name, Lot_Number, Source_Location"
+            "msg": "Upload Excel with columns: Purchase_order, Product_Name, Lot_Number, Source_Location\nOptional: Branch column for filtering"
         }
     }
     
@@ -1094,9 +1168,22 @@ def main():
                         st.error(f"❌ Missing columns: {', '.join(missing_cols)}")
                         continue
                     
-                    with st.expander("📊 Preview Uploaded Data", expanded=True):
-                        st.dataframe(df.head(10), use_container_width=True)
-                        st.caption(f"Total rows: {len(df)}")
+                    # Preview data with branch filter applied
+                    filtered_df = filter_data_by_branch(df, branch)
+                    
+                    with st.expander("📊 Preview Data", expanded=True):
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("Total Records", len(df))
+                        with col2:
+                            st.metric("Filtered Records", len(filtered_df))
+                        
+                        st.dataframe(filtered_df.head(10), use_container_width=True)
+                        
+                        if len(filtered_df) < len(df):
+                            st.caption(f"Showing {len(filtered_df)} of {len(df)} records (filtered by branch: {branch})")
+                        else:
+                            st.caption(f"Total rows: {len(filtered_df)}")
                     
                     col1, col2, col3 = st.columns([1, 2, 1])
                     with col2:
@@ -1131,7 +1218,7 @@ def main():
                                                               uid, os.getenv('ODOO_PASSWORD'), 
                                                               log_container, branch)
                             
-                            st.success(f"✅ Execution complete! Processed {len(df)} records.")
+                            st.success(f"✅ Execution complete! Processed {len(results)} records.")
                             
                             # Display metrics
                             display_metrics(results)
