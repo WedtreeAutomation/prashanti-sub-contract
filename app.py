@@ -292,6 +292,26 @@ def filter_data_by_branch(df, branch_name, branch_column="Branch"):
     return filtered_df
 
 # ==========================================
+# COMPANY HELPER FUNCTION
+# ==========================================
+def get_company_id(company_name, models, db, uid, password):
+    """Get company ID by name"""
+    if not company_name or pd.isna(company_name):
+        return None
+    
+    company = models.execute_kw(
+        db, uid, password,
+        'res.company',
+        'search_read',
+        [[('name', '=', company_name)]],
+        {'fields': ['id', 'name'], 'limit': 1}
+    )
+    
+    if company:
+        return company[0]['id']
+    return None
+
+# ==========================================
 # HELPER FUNCTIONS
 # ==========================================
 def normalize_product_name(name):
@@ -383,12 +403,20 @@ def process_product_creation(df, models, db, uid, password, log_container, branc
             category_name = str(row.get("Category", "")).strip()
             sales_price = float(row.get("Sales Price", 0.0))
             cost_price = float(row.get("Cost Price", 0.0))
+            company_name = str(row.get("Company", "")).strip() if "Company" in df.columns else None
             
             log_container.write(f"**Processing SKU:** {sku} | {product_name}")
             
             category_id = get_category_id(category_name, models, db, uid, password)
             if not category_id:
                 raise Exception(f"Category Not Found: {category_name}")
+            
+            # Get company ID if provided
+            company_id = None
+            if company_name:
+                company_id = get_company_id(company_name, models, db, uid, password)
+                if company_id:
+                    log_container.write(f"Company: {company_name} (ID: {company_id})")
             
             product_ids = find_product(sku, models, db, uid, password)
             
@@ -398,10 +426,21 @@ def process_product_creation(df, models, db, uid, password, log_container, branc
                 if not success:
                     log_container.warning(msg)
                 
+                # Prepare update values
+                update_vals = {
+                    "name": product_name, 
+                    "list_price": sales_price, 
+                    "standard_price": cost_price, 
+                    "categ_id": category_id, 
+                    "tracking": "serial", 
+                    "route_ids": [(4, RESUPPLY_ROUTE_ID)]
+                }
+                if company_id:
+                    update_vals["company_id"] = company_id
+                
                 models.execute_kw(db, uid, password, "product.template", "write", [
                     [product_id],
-                    {"name": product_name, "list_price": sales_price, "standard_price": cost_price, 
-                     "categ_id": category_id, "tracking": "serial", "route_ids": [(4, RESUPPLY_ROUTE_ID)]}
+                    update_vals
                 ])
                 log_container.success(f"✓ Product Updated: {product_id}")
                 
@@ -411,9 +450,17 @@ def process_product_creation(df, models, db, uid, password, log_container, branc
                                "Action": "Updated", "Message": f"Updated ID {product_id}"})
             else:
                 product_vals = {
-                    "name": product_name, "sku": sku, "list_price": sales_price, "standard_price": cost_price,
-                    "categ_id": category_id, "tracking": "serial", "route_ids": [(4, RESUPPLY_ROUTE_ID)]
+                    "name": product_name, 
+                    "sku": sku, 
+                    "list_price": sales_price, 
+                    "standard_price": cost_price,
+                    "categ_id": category_id, 
+                    "tracking": "serial", 
+                    "route_ids": [(4, RESUPPLY_ROUTE_ID)]
                 }
+                if company_id:
+                    product_vals["company_id"] = company_id
+                
                 product_id = models.execute_kw(db, uid, password, "product.template", "create", [product_vals])
                 log_container.success(f"✓ Product Created: {product_id}")
                 
@@ -445,6 +492,7 @@ def process_bom(df, models, db, uid, password, log_container, branch_filter=None
             component_sku = str(row.get("Component_SKU", "")).strip()
             component_qty = float(row.get("Component_Qty", 0.0))
             subcontractor_name = str(row.get("Subcontractor", "")).strip()
+            company_name = str(row.get("Company", "")).strip() if "Company" in df.columns else None
             
             log_container.write(f"**Processing BOM:** {finished_sku} (Component: {component_sku})")
             
@@ -496,6 +544,13 @@ def process_bom(df, models, db, uid, password, log_container, branch_filter=None
                 raise Exception(f"Subcontractor not found: {subcontractor_name}")
             subcontractor_id = subcontractor[0]['id']
             
+            # Get company ID if provided
+            company_id = None
+            if company_name:
+                company_id = get_company_id(company_name, models, db, uid, password)
+                if company_id:
+                    log_container.write(f"Company: {company_name} (ID: {company_id})")
+            
             # Check Existing BOM
             existing_bom = models.execute_kw(
                 db, uid, password,
@@ -521,6 +576,8 @@ def process_bom(df, models, db, uid, password, log_container, branch_filter=None
                     'product_qty': component_qty
                 })]
             }
+            if company_id:
+                bom_vals['company_id'] = company_id
             
             bom_id = models.execute_kw(db, uid, password, 'mrp.bom', 'create', [bom_vals])
             log_container.success(f"✅ BOM Created Successfully for {finished_sku}. BOM ID: {bom_id}")
@@ -554,6 +611,7 @@ def process_purchase_order(df, models, db, uid, password, log_container, branch_
         vendor_name = str(df.iloc[0]["Vendor_Name"]).strip()
         purchase_team_name = str(df.iloc[0]["Purchase_Team"]).strip()
         partner_ref = str(df.iloc[0]["Partner_Ref"]).strip()
+        company_name = str(df.iloc[0].get("Company", "")).strip() if "Company" in df.columns else None
         
         log_container.write("=" * 80)
         log_container.write("CREATING SINGLE PURCHASE ORDER")
@@ -561,6 +619,7 @@ def process_purchase_order(df, models, db, uid, password, log_container, branch_
         log_container.write(f"Vendor       : {vendor_name}")
         log_container.write(f"Purchase Team: {purchase_team_name}")
         log_container.write(f"Partner Ref  : {partner_ref}")
+        log_container.write(f"Company      : {company_name if company_name else 'Default'}")
         log_container.write("=" * 80)
         
         # Get Vendor
@@ -586,6 +645,15 @@ def process_purchase_order(df, models, db, uid, password, log_container, branch_
         if not team:
             raise Exception(f"Purchase Team not found: {purchase_team_name}")
         team_id = team[0]['id']
+        
+        # Get Company
+        company_id = None
+        if company_name:
+            company_id = get_company_id(company_name, models, db, uid, password)
+            if company_id:
+                log_container.write(f"Company Found: {company_name} (ID: {company_id})")
+            else:
+                log_container.warning(f"Company not found: {company_name}. Using default company.")
         
         # Build PO Lines
         order_lines = []
@@ -666,6 +734,8 @@ def process_purchase_order(df, models, db, uid, password, log_container, branch_
             'partner_ref': partner_ref,
             'order_line': order_lines
         }
+        if company_id:
+            po_vals['company_id'] = company_id
         
         po_id = models.execute_kw(db, uid, password, 'purchase.order', 'create', [po_vals])
         log_container.write(f"\nPurchase Order Created. PO ID: {po_id}")
@@ -1126,17 +1196,17 @@ def main():
         tab1: {
             "name": "Product Creation",
             "cols": ["Product Name", "SKU", "Category", "Sales Price", "Cost Price"],
-            "msg": "Upload Excel with columns: Product Name, SKU, Category, Sales Price, Cost Price\nOptional: Branch column for filtering"
+            "msg": "Upload Excel with columns: Product Name, SKU, Category, Sales Price, Cost Price\nOptional: Branch, Company columns for filtering"
         },
         tab2: {
             "name": "Bill Of Materials",
             "cols": ["Finished_SKU", "Component_SKU", "Component_Qty", "Subcontractor"],
-            "msg": "Upload Excel with columns: Finished_SKU, Component_SKU, Component_Qty, Subcontractor\nOptional: Branch column for filtering"
+            "msg": "Upload Excel with columns: Finished_SKU, Component_SKU, Component_Qty, Subcontractor\nOptional: Branch, Company columns for filtering"
         },
         tab3: {
             "name": "Purchaseorder",
             "cols": ["Vendor_Name", "Purchase_Team", "Product_Name", "Qty", "Price_Unit", "Discount", "Partner_Ref"],
-            "msg": "Upload Excel with columns: Vendor_Name, Purchase_Team, Product_Name, Qty, Price_Unit, Discount, Partner_Ref\nOptional: Branch column for filtering"
+            "msg": "Upload Excel with columns: Vendor_Name, Purchase_Team, Product_Name, Qty, Price_Unit, Discount, Partner_Ref\nOptional: Branch, Company columns for filtering"
         },
         tab4: {
             "name": "Resupply",
