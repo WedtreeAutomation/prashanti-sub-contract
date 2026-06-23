@@ -193,7 +193,7 @@ BRANCH_OPTIONS = ["All"] + list(BRANCH_KEYWORDS.keys())
 # ROUTE CONFIGURATION (Backend Team Modifications)
 # ==========================================
 RESUPPLY_ROUTE_ID = 12  # Resupply route for internal transfers
-BUY_ROUTE_ID = 5        # Buy route for purchase orders (NEW - Added by backend team)
+BUY_ROUTE_ID = 5        # Buy route for purchase orders (Added by backend team)
 
 # ==========================================
 # AUTHENTICATION FUNCTION
@@ -315,6 +315,28 @@ def get_company_id(company_name, models, db, uid, password):
     
     if company:
         return company[0]['id']
+    return None
+
+def get_company_id_with_cache(company_name, models, db, uid, password, cache):
+    """Get company ID by name with caching for performance"""
+    if not company_name or pd.isna(company_name):
+        return None
+    
+    if company_name in cache:
+        return cache[company_name]
+    
+    company = models.execute_kw(
+        db, uid, password,
+        'res.company',
+        'search_read',
+        [[('name', 'ilike', company_name)]],
+        {'fields': ['id', 'name'], 'limit': 1}
+    )
+    
+    if company:
+        cache[company_name] = company[0]['id']
+        return company[0]['id']
+    
     return None
 
 # ==========================================
@@ -795,15 +817,16 @@ def process_resupply(df, models, db, uid, password, log_container, branch_filter
         return []
     
     results = []
+    company_cache = {}  # Cache for company lookups
     
     try:
-        # Validate required columns
-        required_cols = ["Purchase_order", "Product_Name", "Lot_Number", "Source_Location"]
-        for col in required_cols:
-            if col not in df.columns:
-                raise Exception(f"Missing column: {col}")
+        # Validate required columns - Company is now required for resupply
+        required_cols = ["Purchase_order", "Product_Name", "Lot_Number", "Source_Location", "Company"]
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise Exception(f"Missing required columns for Resupply: {', '.join(missing_cols)}")
         
-        # Build Mapping: (PO, Product) -> Lots + Source Location
+        # Build Mapping: (PO, Product) -> Lots + Source Location + Company
         mapping = {}
         
         for _, row in df.iterrows():
@@ -811,18 +834,28 @@ def process_resupply(df, models, db, uid, password, log_container, branch_filter
             product = str(row["Product_Name"]).strip()
             lot = str(row["Lot_Number"]).strip()
             source_location = str(row["Source_Location"]).strip()
+            company_name = str(row["Company"]).strip()
+            
+            # Get company ID with caching
+            company_id = get_company_id_with_cache(company_name, models, db, uid, password, company_cache)
+            
+            if not company_id:
+                raise Exception(f"Company Not Found: {company_name}")
             
             key = (po, normalize_product_name(product))
             
             if key not in mapping:
                 mapping[key] = {
                     "lots": [],
-                    "source_location": source_location
+                    "source_location": source_location,
+                    "company_id": company_id,
+                    "company_name": company_name
                 }
             
             mapping[key]["lots"].append(lot)
         
         log_container.write(f"Built mapping with {len(mapping)} unique (PO, Product) combinations")
+        log_container.write(f"Companies involved: {set(v['company_name'] for v in mapping.values())}")
         
         # Process each PO
         for po_number in df["Purchase_order"].dropna().unique():
@@ -911,18 +944,26 @@ def process_resupply(df, models, db, uid, password, log_container, branch_filter
                     key = (po_number, normalized_product_name)
                     
                     if key not in mapping:
-                        log_container.warning(f"No mapping found for {product_name} (Normalized: {normalized_product_name})")
+                        log_container.warning(f"No mapping found for {product_name}")
+                        log_container.write(f"Normalized: {normalized_product_name}")
+                        log_container.write(f"Available keys for PO {po_number}:")
+                        for k in mapping.keys():
+                            if k[0] == po_number:
+                                log_container.write(f"  - {k[1]}")
                         continue
                     
                     processed_move_found = True
                     
                     lots = mapping[key]["lots"]
                     source_location_name = mapping[key]["source_location"]
+                    company_id = mapping[key]["company_id"]
+                    company_name = mapping[key]["company_name"]
                     
                     log_container.write(f"\n✅ MATCH FOUND")
-                    log_container.write(f"Product : {product_name}")
-                    log_container.write(f"Lots : {lots}")
-                    log_container.write(f"Move ID : {move_id}")
+                    log_container.write(f"Company     : {company_name} (ID: {company_id})")
+                    log_container.write(f"Product     : {product_name}")
+                    log_container.write(f"Lots        : {lots}")
+                    log_container.write(f"Move ID     : {move_id}")
                     
                     demand_qty = int(move["product_uom_qty"])
                     
@@ -982,20 +1023,43 @@ def process_resupply(df, models, db, uid, password, log_container, branch_filter
                     
                     log_container.write(f"Deleted {len(existing_lines)} existing move lines")
                     
-                    # Create new move lines for each lot
+                    # Create new move lines for each lot with company filter
                     for lot_number in lots:
+                        # Now searching with company_id filter
                         lot = models.execute_kw(
                             db, uid, password,
-                            'stock.lot',
-                            'search_read',
-                            [[('name', '=', lot_number)]],
-                            {'fields': ['id'], 'limit': 1}
+                            "stock.lot",
+                            "search_read",
+                            [[
+                                ("name", "=", lot_number),
+                                ("product_id", "=", product_id),
+                                ("company_id", "=", company_id)  # Company filter added
+                            ]],
+                            {
+                                "fields": ["id", "name", "company_id", "product_id"],
+                                "limit": 1
+                            }
                         )
                         
                         if not lot:
-                            raise Exception(f"Lot Not Found: {lot_number}")
+                            raise Exception(f"""
+Lot Not Found
+
+Lot Number : {lot_number}
+Product    : {product_name}
+Company    : {company_name}
+
+Verify:
+1. Lot exists
+2. Lot belongs to company
+3. Lot is linked to product
+""")
                         
                         lot_id = lot[0]["id"]
+                        lot_company = lot[0]["company_id"][1] if lot[0]["company_id"] else "N/A"
+                        
+                        log_container.write(f"Lot Found -> {lot_number}")
+                        log_container.write(f"Lot Company: {lot_company}")
                         
                         move_line_id = models.execute_kw(
                             db, uid, password,
@@ -1017,9 +1081,30 @@ def process_resupply(df, models, db, uid, password, log_container, branch_filter
                         log_container.write(f"Created Move Line -> {lot_number} ({move_line_id})")
                 
                 if processed_move_found:
+                    # Verify move lines before validation
+                    move_ids = [m['id'] for m in moves]
+                    move_lines = models.execute_kw(
+                        db, uid, password,
+                        'stock.move.line',
+                        'search_read',
+                        [[('move_id', 'in', move_ids)]],
+                        {'fields': ['id', 'product_id', 'lot_id', 'quantity', 'picked']}
+                    )
+                    
                     log_container.write("\n" + "=" * 80)
                     log_container.write(f"VALIDATING : {resupply_name}")
                     log_container.write("=" * 80)
+                    
+                    log_container.write("MOVE LINES:")
+                    for ml in move_lines:
+                        log_container.write(f"  ID: {ml['id']}, Product: {ml['product_id'][1]}, "
+                                          f"Lot: {ml['lot_id'][1] if ml['lot_id'] else 'None'}, "
+                                          f"Qty: {ml['quantity']}, Picked: {ml['picked']}")
+                    
+                    log_container.write("\nMOVES:")
+                    for move in moves:
+                        log_container.write(f"  MOVE: {move['id']}, Product: {move['product_id'][1]}, "
+                                          f"Demand: {move['product_uom_qty']}")
                     
                     models.execute_kw(
                         db, uid, password,
@@ -1034,7 +1119,8 @@ def process_resupply(df, models, db, uid, password, log_container, branch_filter
                         "PO Number": po_number, 
                         "Resupply": resupply_name, 
                         "Status": "Success", 
-                        "Message": "Resupply validated"
+                        "Company": company_name,
+                        "Message": f"Resupply validated with company: {company_name}"
                     })
                 else:
                     log_container.warning(
@@ -1221,8 +1307,8 @@ def main():
         },
         tab4: {
             "name": "Resupply",
-            "cols": ["Purchase_order", "Product_Name", "Lot_Number", "Source_Location"],
-            "msg": "Upload Excel with columns: Purchase_order, Product_Name, Lot_Number, Source_Location\nOptional: Branch column for filtering"
+            "cols": ["Purchase_order", "Product_Name", "Lot_Number", "Source_Location", "Company"],
+            "msg": "Upload Excel with columns: Purchase_order, Product_Name, Lot_Number, Source_Location, Company (Required for company-aware lot filtering)"
         }
     }
     
